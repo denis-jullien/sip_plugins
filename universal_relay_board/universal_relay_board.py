@@ -30,14 +30,14 @@ except IOError:
 # fmt: off
 urls.extend(
     [
-        "/wrb", "plugins.universal_relay_board.settings",
-        "/wrbu", "plugins.universal_relay_board.update",
+        "/urb", "plugins.universal_relay_board.settings",
+        "/urbu", "plugins.universal_relay_board.update",
     ]
 )
 # fmt: on
 
 # Add this plugin to the home page plugins menu
-gv.plugin_menu.append([_("Universal Relay Board"), "/wrb"])
+gv.plugin_menu.append([_("Universal Relay Board"), "/urb"])
 
 params = {}
 
@@ -48,7 +48,10 @@ def load_params():
         with open("./data/universal_relay_board.json", "r") as f:  # Read the settings from file
             params = json.load(f)
     except IOError:  #  If file does not exist create file with defaults.
-        params = {"relays": 8, "active": "low"}
+        params = {
+            "active": "high",
+            "gpio_pins": [7, 15, 31, 37]  # Default physical pins
+        }
         with open("./data/universal_relay_board.json", "w") as f:
             json.dump(params, f, indent=4, sort_keys=True)
 
@@ -61,12 +64,7 @@ try:
             GPIO.setmode(
                 GPIO.BOARD
             )  # IO channels are identified by header connector pin numbers. Pin numbers are
-        relay_pins = [
-            7,  # GPIO 5 relay 1
-            15,  # GPIO 6 relay 2
-            31,  # GPIO 13 relay 3
-            37,  # GPIO 16 relay 4
-        ]
+        relay_pins = params["gpio_pins"][:]
         for i in range(len(relay_pins)):
             try:
                 relay_pins[i] = gv.pin_map[relay_pins[i]]
@@ -74,7 +72,7 @@ try:
                 relay_pins[i] = 0
     else:
         print("relay board plugin only supported on pi.")
-except exception as e:
+except BaseException as e:
     print(f"Relay board: GPIO pins not set : {e}")
     pass
 
@@ -84,13 +82,19 @@ def init_pins():
     global pi
 
     try:
-        for i in range(params["relays"]):
+        for i in range(len(relay_pins)):
             if gv.use_pigpio:
                 pi.set_mode(relay_pins[i], pigpio.OUTPUT)
-                pi.write(relay_pins[i], 1)
+                if params["active"] == "low":
+                    pi.write(bcm_pin, 1)  # High = off for active low
+                else:
+                    pi.write(bcm_pin, 0)  # Low = off for active high
             else:
                 GPIO.setup(relay_pins[i], GPIO.OUT)
-                GPIO.output(relay_pins[i], GPIO.HIGH)
+                if params["active"] == "low":
+                    GPIO.output(relay_pins[i], GPIO.HIGH)  # High = off for active low
+                else:
+                    GPIO.output(relay_pins[i], GPIO.LOW)   # Low = off for active high
             time.sleep(0.1)
     except:
         pass
@@ -101,9 +105,9 @@ def on_zone_change(arg):  #  arg is just a necessary placeholder.
     """ Switch relays when core program signals a change in zone state."""
     global pi
     with gv.output_srvals_lock:
-        for i in range(params["relays"]):
+        for i in range(len(relay_pins)):
             try:
-                if gv.output_srvals[i]:  # if station is set to on
+                if (gv.output_srvals[i] and params["active"] == "low") or (not gv.output_srvals[i] and params["active"] != "low"):  # if station is set to on
                     if gv.use_pigpio:
                         pi.write(relay_pins[i], 0)
                     else:
@@ -133,6 +137,7 @@ class settings(ProtectedPage):
     def GET(self):
         with open("./data/universal_relay_board.json", "r") as f:  # Read the settings from file
             params = json.load(f)
+        params["gpio_pins_str"] = ", ".join(map(str, params.get("gpio_pins", [])))
         return template_render.universal_relay_board(params)
 
 
@@ -142,10 +147,41 @@ class update(ProtectedPage):
     def GET(self):
         qdict = web.input()
         changed = False
-        if params["relays"] != int(qdict["relays"]
-        ):  # if the number of relay channels changed, update the params
-            params["relays"] = int(qdict["relays"])
+
+        # Update active state
+        if "active" in qdict and params["active"] != qdict["active"]:
+            params["active"] = qdict["active"]
             changed = True
+        
+        # Update GPIO pins from comma-separated string
+        if "gpio_pins" in qdict:
+            try:
+                # Parse comma-separated pin numbers
+                pin_string = qdict["gpio_pins"].strip()
+                if pin_string:
+                    # Split by comma, strip whitespace, convert to int
+                    new_gpio_pins = []
+                    for pin_str in pin_string.split(","):
+                        pin_str = pin_str.strip()
+                        if pin_str:
+                            pin_num = int(pin_str)
+                            # Valid physical pins that can be used as GPIO
+                            valid_physical_pins = [3, 7, 8, 10, 11, 12, 13, 15, 16, 18, 19, 21, 22, 23, 24, 26, 29, 31, 32, 33, 35, 36, 37, 38, 40]
+                            if pin_num in valid_physical_pins:
+                                new_gpio_pins.append(pin_num)
+                            else:
+                                print(f"Invalid pin number: {pin_num}")
+                else:
+                    new_gpio_pins = []
+                
+                if new_gpio_pins != params["gpio_pins"]:
+                    params["gpio_pins"] = new_gpio_pins
+                    changed = True
+                    
+            except ValueError as e:
+                print(f"Error parsing GPIO pins: {e}")
+                # Keep existing pins on error
+
         if changed:
             init_pins()
             with open(
